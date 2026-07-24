@@ -52,12 +52,14 @@ llama-server ── listen: 動的に確保した空きポート(内部専用)
 ### 2.1 コマンドライン全体の形
 
 ```
-loopguard [loopguard-flags...] --- <child-command> [child-args...]
+loopguard [loopguard-flags...] -- <child-command> [child-args...]
 ```
 
-`---` (ハイフン3つ、固定・変更不可)がloopguard自身のフラグと子プロセスのコマンドラインを
-分離するセパレータ。`os.Args`を先頭から走査し、要素が正確に`"---"`と一致する最初の位置で
+`--` (ハイフン2つ、固定・変更不可)がloopguard自身のフラグと子プロセスのコマンドラインを
+分離するセパレータ。`os.Args`を先頭から走査し、要素が正確に`"--"`と一致する最初の位置で
 分割する。見つからない場合は起動時エラーで即終了。
+
+`--help`フラグが指定された場合、使用方法をstderrへ出力して終了する。
 
 ### 2.2 loopguard 自身のフラグ(これで全部)
 
@@ -65,12 +67,9 @@ loopguard [loopguard-flags...] --- <child-command> [child-args...]
 |---|---|---|---|
 | `--port` | int | 必須 | loopguardが外部(llama-swap)向けに待ち受けるポート。`${PORT}`をそのまま渡す |
 | `--child-port` | int | 0 (自動) | 子プロセスに割り当てる内部ポート。0なら自動確保 |
-| `--min-period-bytes` | int | 150 | ループ検知の最小周期長(バイト数)。3章参照 |
-| `--max-period-bytes` | int | 1600 | ループ検知の最大周期長(バイト数)。3章参照 |
-| `--min-repeats` | int | 3 | 周期が何回繰り返されたらループとみなすか |
+| `--loop-threshold-bytes` | int | 500 | ループとみなすために必要な「冗余バイト数」のしきい値。3章参照 |
 
-以上5つのみ。ヘルスチェックパス、ログレベル、セパレータ文字列、finish_reason文言、
-子プロセス停止タイムアウトなどは全てコード内定数として固定し、フラグ化しない。
+以上3つのみ。ヘルスチェックパス、ログレベル、セパレータ文字列、finish_reason文言、子プロセス停止タイムアウト、最小周期、最大周期などは全てコード内定数として固定し、フラグ化しない。
 必要になった時点で追加すればよい。
 
 対象とする生成系エンドポイントは以下の4つに固定する(コード内定数、フラグ化しない):
@@ -86,19 +85,20 @@ loopguard [loopguard-flags...] --- <child-command> [child-args...]
 
 ## 3. ループ検知しきい値の考え方
 
-ループの1周期は短くとも50トークン、長ければ200〜400トークン程度になり得る想定。
-本プロキシは文字列(バイト列)ベースでしか判定できないため、トークン数をバイト数に換算する
-必要がある。厳密な変換係数はトークナイザ・言語(特に日本語などCJK圏はUTF-8で1文字あたり
-3バイト消費するため英語よりバイト/トークン比が大きくなりやすい)に依存するため、以下は
-あくまで目安のデフォルト値であり、実運用のログを見ながら調整すること。
+ループの1周期は短くとも50バイト、長ければ4000バイト程度になり得る想定。
+本プロキシは文字列(バイト列)ベースであるため、周期の長さそのものではなく**「冗余バイト数」**で判定する。
+これにより、短い周期のループでも十分に繰り返せば検知でき、長い周期のループでも少ない繰り返しで検知できる。
 
-- `--min-period-bytes` デフォルト150 ( 約50トークン x 3バイト、控えめな下限)
-- `--max-period-bytes` デフォルト1600 ( 約400トークン x 4バイト)
-- `--min-repeats` デフォルト3 (長い周期を3回繰り返した時点で十分ループと判断できるため、
-  以前案の4より緩めてよい。周期が長いぶん、繰り返し回数を厳しくしすぎるとウィンドウが
-  数千バイトになり検知が遅れる)
+- `--loop-threshold-bytes` デフォルト 500 （周期 × (繰り返し回数 - 1) がこの値を超えた時点でループと判定）
+- 最小周期 (`min-period-bytes`) デフォルト 1 ：コード内定数。1バイトのループでも検出対象。
+- 最大周期 (`max-period-bytes`) デフォルト 4000 ：コード内定数。非常に長い周期を除外する保険。
 
-この設定で最悪ケースの監視ウィンドウは `max-period-bytes x min-repeats` = 4800バイト程度になる。
+例：
+- 1バイトの周期（例：`！`の繰り返し）： $1 \times (\text{repeats} - 1) > 500 \Rightarrow$ **501回目**で切断
+- 100バイトの周期： $100 \times (\text{repeats} - 1) > 500 \Rightarrow$ **6回目**で切断  
+- 1000バイトの周期： $1000 \times (\text{repeats} - 1) > 500 \Rightarrow$ **2回目**で切断
+
+この設定で最悪ケースの監視ウィンドウは `max-period-bytes + loop-threshold-bytes` = 4500バイト程度になる。
 4章のアルゴリズムはこの程度のウィンドウなら余裕を持って高速に処理できる。
 
 ---
@@ -112,12 +112,12 @@ loopguard [loopguard-flags...] --- <child-command> [child-args...]
 
 ### 4.2 手法: KMP接頭辞関数(prefix function / failure function)による最小周期検出
 
-3章の通りウィンドウが大きくなったため、ナイーブな全周期総当たり(周期候補ごとに窓全体を
+3章の通りウィンドウが大きくなったため、ナイープな全周期総当たり(周期候補ごとに窓全体を
 比較する O(周期数 x 窓長) のアルゴリズム)は避け、標準的なKMP接頭辞関数を使って
 「窓の最小周期」を1回の線形スキャンで求める。
 
 ```go
-// window: 直近 W = maxPeriodBytes * minRepeats バイトのスライス(それより古い部分は破棄)
+// window: 直近 W = maxPeriodBytes + loopThresholdBytes バイトのスライス(それより古い部分は破棄)
 // 標準的なKMP prefix function
 func prefixFunction(s []byte) []int {
     n := len(s)
@@ -135,10 +135,10 @@ func prefixFunction(s []byte) []int {
     return pi
 }
 
-func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
+func detectLoop(window []byte, minPeriod, maxPeriod, thresholdBytes int) bool {
     n := len(window)
-    if n < minPeriod*minRepeats {
-        return false // データ不足
+    if n == 0 {
+        return false
     }
     pi := prefixFunction(window)
     period := n - pi[n-1] // このwindowの最小周期(定理: 常に成立する)
@@ -146,7 +146,8 @@ func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
         return false
     }
     reps := n / period
-    if reps < minRepeats {
+    redundantBytes := period * (reps - 1)
+    if redundantBytes <= thresholdBytes {
         return false
     }
     if isWhitespaceOnly(window[:period]) {
@@ -159,7 +160,7 @@ func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
 - リクエストごとに独立した状態(ウィンドウのバイトスライス)を持つこと。goroutine間で共有しない。
 - 新しいSSEチャンクを受信するたびに、累積バッファへ追記し、末尾`W`バイトだけを残して
   古い部分は切り捨てたうえで`detectLoop`を呼ぶ。
-- `W`バイト規模(3章の想定で最大数千バイト)であれば`prefixFunction`の計算コストは
+- `W`バイト規模(3章の想定で最大5000バイト程度)であれば`prefixFunction`の計算コストは
   無視できるレベル(1回あたり最大でも数千回の比較)であり、生成が数千トークンに及んでも
   トータルで十分高速。
 
@@ -169,6 +170,8 @@ func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
 
 **設計の核心(重要なので明記): クライアントが`stream: true`を指定したかどうかに
 関わらず、loopguard から llama-server へのリクエストは常に`stream: true`を強制する。**
+SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control: no-cache`を設定し、
+中継HTTPレイヤーのバッファリングを防ぐ。**
 
 理由: 非ストリーミングのレスポンスはllama-server内部で生成完了まで確定しないため、外部から
 早期打ち切りを判定する材料(部分テキスト)が得られない。常に内部だけSSEにすることで、
@@ -180,10 +183,10 @@ func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
 1. クライアントのリクエストボディをJSONとしてパースし、元の`stream`値を`clientWantsStream`
    として保持する(未指定はfalse扱い)。
 2. リクエストボディの`stream`を`true`に書き換えて子プロセスへPOSTする。
-3. `text/event-stream`としてレスポンスを受け取り、`data: ...`行を1行ずつパースしながら:
+3. `text/event-stream`としてレスポンスを受え取り、`data: ...`行を1行ずつパースしながら:
    - デルタテキストを取り出し、ウィンドウバッファに追記する。
    - `detectLoop`を呼ぶ。
-   - `clientWantsStream == true`の場合: 受け取ったチャンクをそのままクライアントへ中継する。
+   - `clientWantsStream == true`の場合: 受信したチャンクを**即座に(`http.Flusher.Flush()`)**クライアントへ中継する。
    - `clientWantsStream == false`の場合: クライアントへは何も送らず、内部で蓄積するだけ。
 4. ループ検知がトリガーされた場合:
    - 子プロセスへのHTTPリクエストのcontextをcancelし、コネクションを閉じる。
@@ -228,7 +231,7 @@ func detectLoop(window []byte, minPeriod, maxPeriod, minRepeats int) bool {
 
 ### 7.2 子プロセスへのポート指定方法(環境変数優先)
 llama-serverは`--port`に対応する環境変数`LLAMA_ARG_PORT`をサポートしている。ただし
-**CLI引数は環境変数より優先される**ため、子プロセスのargv(`---`以降)に`--port`系トークンが
+**CLI引数は環境変数より優先される**ため、子プロセスのargv(`--`以降)に`--port`系トークンが
 含まれていると環境変数が無視されてしまう。そこで:
 
 1. 子プロセスのargvを走査し、`--port <値>`(空白区切り)および`--port=<値>`(等号区切り)の
@@ -258,10 +261,8 @@ macros:
   latest-llama: >
     loopguard
     --port ${PORT}
-    --min-period-bytes 150
-    --max-period-bytes 1600
-    --min-repeats 3
-    ---
+    --loop-threshold-bytes 500
+    --
     llama-server
     --port ${PORT}
     --metrics
@@ -281,7 +282,7 @@ models:
     ttl: 600
 ```
 
-`--model`以降のモデル固有フラグはmacro展開後の文字列末尾に連結されるため、自然に`---`の
+`--model`以降のモデル固有フラグはmacro展開後の文字列末尾に連結されるため、自然に`--`の
 右側(= llama-serverへの引数)に含まれる。ポート算術は一切不要。
 
 ---
@@ -314,7 +315,7 @@ COPY --from=loopguard-builder /out/loopguard /usr/local/bin/loopguard
 
 1. **正常系**: `/v1/chat/completions`・`/completion`(stream true/false両方)で、通常の応答が
    loopguardを介さない場合と一致すること。
-2. **異常系**: 意図的にループを誘発し、`max-period-bytes x min-repeats`相当が生成された時点で
+2. **異常系**: 意図的にループを誘発し、`loop-threshold-bytes`相当（例: 500バイトの冗材量）が生成された時点で
    クライアントへの応答が終了すること。stream true/falseどちらでも`finish_reason: "length"`で
    終わること。
 3. **並行性**: `--parallel`を2以上にしたllama-serverに対し複数リクエストを同時に投げ、
