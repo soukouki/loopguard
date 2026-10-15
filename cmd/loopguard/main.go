@@ -58,6 +58,8 @@ func main() {
 	// (specification §7.2). CLI args override env vars in llama-server.
 	sanitizedArgs := process.SanitizeChildArgs(cfg.ChildArgs)
 
+	sanitizedArgs = append(sanitizedArgs, "--port", strconv.Itoa(childPort))
+
 	// Prepare the child command.
 	childCmd := exec.Command(cfg.ChildCmd, sanitizedArgs...)
 
