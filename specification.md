@@ -170,8 +170,10 @@ func detectLoop(window []byte, minPeriod, maxPeriod, thresholdBytes int) bool {
 
 **設計の核心(重要なので明記): クライアントが`stream: true`を指定したかどうかに
 関わらず、loopguard から llama-server へのリクエストは常に`stream: true`を強制する。**
-SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control: no-cache`を設定し、
-中継HTTPレイヤーのバッファリングを防ぐ。**
+ストリーミングクライアントへのレスポンスのヘッダーには`X-Accel-Buffering: no`と
+`Cache-Control: no-cache`を設定し、中継HTTPレイヤーのバッファリングを防ぐ。
+非ストリーミングクライアントへのレスポンスの`Content-Type`は`application/json`とする。
+(6章参照)**
 
 理由: 非ストリーミングのレスポンスはllama-server内部で生成完了まで確定しないため、外部から
 早期打ち切りを判定する材料(部分テキスト)が得られない。常に内部だけSSEにすることで、
@@ -240,7 +242,8 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
   チャンクを送らないので、通常は`usage`は取得できない。
 
 打ち切りだったかどうかを機械的に判別したいクライアント向けの追加フィールドは今回のv1では
-実装しない(finish_reason: "length"のみで十分。必要になれば後で足す)。
+実装しない。正常終了では上流が報告したfinish_reasonを使い、打ち切りでのみ`"length"`を返すことで
+区別できるようにした。
 
 ---
 
