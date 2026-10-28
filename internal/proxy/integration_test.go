@@ -57,7 +57,9 @@ func startMockSSE(t *testing.T, pattern string, repeats int) (int, *httptest.Ser
 		}
 		flusher.Flush()
 		for i := 0; i < repeats; i++ {
-			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}]}\n\n", pattern)
+			// The mock must emit valid JSON: the choice object is closed before
+			// the choices array. A JSON parser rejects the chunk otherwise.
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", pattern)
 			flusher.Flush()
 		}
 		fmt.Fprintf(w, "data: [DONE]\n\n")

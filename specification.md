@@ -205,6 +205,10 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
 | `/v1/chat/completions` | `choices[0].delta.content` | `data: [DONE]`、または`finish_reason`が非null |
 | `/infill` | `content`(nativeと同様想定) | `"stop": true` |
 
+データペイロードの解析はJSONパーサ(`encoding/json`)で行う。部分文字列検索ではフィールド名と
+フィールド値を区別できず、`delta.content`がnullのチャンク(OpenAI互換の最初のチャンク)で直後の
+フィールド名をデルタテキストとして取り出してしまう。解析に失敗したチャンクはスキップする。
+
 ---
 
 ## 6. 検知後の応答

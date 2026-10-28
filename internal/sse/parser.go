@@ -2,7 +2,10 @@
 // It extracts "data:" payloads from a byte stream, per specification section 5.3.
 package sse
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // ParseLine parses a single line of an SSE stream.
 // It returns:
@@ -28,93 +31,56 @@ func IsDoneMarker(data string) bool {
 	return data == "[DONE]"
 }
 
+// deltaShape mirrors the union of the response shapes listed in the
+// specification §5 mapping table. Fields from shapes that do not apply stay
+// zero.
+type deltaShape struct {
+	Choices []struct {
+		Text  string `json:"text"`
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Content string `json:"content"`
+	Text    string `json:"text"`
+}
+
 // ExtractDelta extracts the delta text from a parsed JSON chunk for the
 // supported endpoints, per specification section 5.196-203.
 //
-// It returns the raw string (unescaped JSON value) of the delta content, or
-// empty string if the chunk does not contain usable delta text (e.g. a
-// finish_reason-only chunk) or cannot be parsed.
+// It returns the unescaped delta text, or empty string if the chunk does not
+// contain usable delta text (e.g. a finish_reason-only chunk) or cannot be
+// parsed.
 //
-// Supported shapes:
-//
-//	{"choices":[{"text":"..."}]}            // /completion, /v1/completions
-//	{"choices":[{"delta":{"content":"..."}}]} // /v1/chat/completions
-//
-// This function intentionally avoids importing a JSON library at this layer
-// and performs a lightweight substring search so it remains dependency-free.
-// It first looks for "content" (chat completions), then falls back to "text"
-// (completion/completions endpoints).
+// Parsing goes through encoding/json rather than a substring search. A
+// substring search cannot tell a field name from a field value, so the
+// role-only first chunk of /v1/chat/completions, where delta.content is null,
+// returned the following field name as delta text.
 func ExtractDelta(data string) string {
 	// Reject the terminal marker.
 	if IsDoneMarker(data) {
 		return ""
 	}
-	if len(data) == 0 || data[0] != '{' {
+	var shape deltaShape
+	if err := json.Unmarshal([]byte(data), &shape); err != nil {
 		return ""
 	}
-	// Try "content" first (covers /completion native and /v1/chat/completions delta shape).
-	if delta := extractAfterField(data, "content"); delta != "" {
-		return delta
-	}
-	// Fall back to "text" (covers /v1/completions and native /completion when shaped as text).
-	return extractAfterField(data, "text")
-}
 
-// extractAfterField finds the first occurrence of `"field"` in data and
-// returns the unescaped string value of the immediately following quoted
-// JSON string. Returns "" if the field is absent or the value is not a
-// string (e.g. a number or object — as is the case for finish_reason).
-func extractAfterField(data, field string) string {
-	needle := field + `":`
-	idx := strings.Index(data, needle)
-	if idx < 0 {
-		return ""
+	if len(shape.Choices) > 0 {
+		choice := shape.Choices[0]
+		// /v1/chat/completions puts the delta under choices[0].delta, while
+		// /v1/completions puts it at choices[0].text.
+		if choice.Delta.Content != "" {
+			return choice.Delta.Content
+		}
+		if choice.Text != "" {
+			return choice.Text
+		}
 	}
-	// Skip past the field name AND its colon.
-	rest := data[idx+len(needle):]
-	return extractFirstQuotedString(rest)
-}
 
-// extractFirstQuotedString returns the content of the first "..." string
-// in the input, with JSON escapes processed minimally (\n, \t, \", \\, \/).
-// Returns empty string if no quoted string is found.
-func extractFirstQuotedString(s string) string {
-	// Find first quote.
-	start := strings.IndexByte(s, '"')
-	if start < 0 {
-		return ""
+	// Native /completion and /infill carry the delta at top level.
+	if shape.Content != "" {
+		return shape.Content
 	}
-	buf := strings.Builder{}
-	i := start + 1
-	for i < len(s) {
-		c := s[i]
-		if c == '\\' && i+1 < len(s) {
-			next := s[i+1]
-			switch next {
-			case 'n':
-				buf.WriteByte('\n')
-			case 't':
-				buf.WriteByte('\t')
-			case 'r':
-				buf.WriteByte('\r')
-			case '"':
-				buf.WriteByte('"')
-			case '\\':
-				buf.WriteByte('\\')
-			case '/':
-				buf.WriteByte('/')
-			default:
-				buf.WriteByte(c)
-				buf.WriteByte(next)
-			}
-			i += 2
-			continue
-		}
-		if c == '"' {
-			break
-		}
-		buf.WriteByte(c)
-		i++
-	}
-	return buf.String()
+	return shape.Text
 }
