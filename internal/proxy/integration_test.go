@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sou7/loopguard/internal/detect"
+	"github.com/sou7/loopguard/internal/sse"
 )
 
 // generateCounterPattern returns a `length`-byte string with a minimal
@@ -182,5 +184,81 @@ func TestDetectLoop_RealisticScenario(t *testing.T) {
 	// Redundant bytes: 160 * 2 = 320 > 250. Should detect.
 	if !detect.DetectLoop(window, 1, 4000, 250) {
 		t.Fatal("expected loop detected with 3 repetitions of 160-byte chunk")
+	}
+}
+
+// TestResponseContentTypeMatchesBody verifies that a non-streaming client gets
+// application/json, matching the single JSON document written to it, while a
+// streaming client still gets text/event-stream.
+func TestResponseContentTypeMatchesBody(t *testing.T) {
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flush", http.StatusInternalServerError)
+			return
+		}
+		f.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer childServer.Close()
+
+	port := parsePort(childServer.URL)
+	p := New(port, 1, 4000, 250)
+
+	// Non-streaming client.
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[]}`)))
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if got := rr.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("non-streaming Content-Type = %q, want application/json", got)
+	}
+	if !json.Valid(rr.Body.Bytes()) {
+		t.Errorf("non-streaming body is not valid JSON: %s", rr.Body.String())
+	}
+
+	// Streaming client.
+	req = httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[],"stream":true}`)))
+	rr = httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if got := rr.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("streaming Content-Type = %q, want text/event-stream", got)
+	}
+}
+
+// TestLoopTerminationChunkIsJSON verifies the chunk sent on loop detection is a
+// parseable JSON document. The previous version wrote a comma after the closing
+// brace, so clients that parse each data payload failed.
+func TestLoopTerminationChunkIsJSON(t *testing.T) {
+	pattern := generateCounterPattern(160)
+	childPort, childServer := startMockSSE(t, pattern, 4)
+	defer childServer.Close()
+
+	p := New(childPort, 1, 4000, 250)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[],"stream":true}`)))
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	var chunk string
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		if strings.HasPrefix(line, "data:") && !sse.IsDoneMarker(strings.TrimSpace(line[5:])) {
+			chunk = strings.TrimSpace(line[5:])
+		}
+	}
+	if chunk == "" {
+		t.Fatalf("no data chunk found in response: %s", rr.Body.String())
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(chunk), &parsed); err != nil {
+		t.Fatalf("termination chunk is not valid JSON: %v (%s)", err, chunk)
+	}
+	choices, ok := parsed["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("termination chunk has no choices: %s", chunk)
+	}
+	if choices[0].(map[string]any)["finish_reason"] != "length" {
+		t.Errorf("finish_reason = %v, want length", choices[0].(map[string]any)["finish_reason"])
 	}
 }

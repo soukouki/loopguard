@@ -161,10 +161,17 @@ func (p *Proxy) handleGeneration(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	// Prevent intermediate proxies/servers from buffering the stream.
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-cache")
+	if clientWantsStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Prevent intermediate proxies/servers from buffering the stream.
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		// A non-streaming client receives one JSON document, not an event
+		// stream, so the content type has to match the body. Headers cannot be
+		// changed after WriteHeader, so this decision has to be made here.
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(http.StatusOK)
 
 	p.streamWithLoopDetection(w, r, resp.Body, clientWantsStream, cancel)
@@ -257,7 +264,6 @@ func (p *Proxy) streamWithLoopDetection(
 	} else {
 		// 5.5/6.2: Assemble a non-streaming JSON response from accumulated text.
 		assemble := buildNonStreamingResponse(r, accumulatedText.String(), finishReasonForced)
-		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, assemble)
 	}
 }
@@ -268,8 +274,10 @@ func (p *Proxy) emitLoopTermination(w http.ResponseWriter, r *http.Request,
 	accumulated strings.Builder, clientWants bool) {
 	if clientWants {
 		// 6.2: Send final chunk with finish_reason: "length", then [DONE].
-		fmt.Fprintf(w, "data: {\"choices\":[{\"finish_reason\":%q}]}, \n\n", finishReasonForced)
-		fmt.Fprintf(w, "data: [DONE]\n\n")
+		// The chunk is emitted as a JSON document without the trailing comma
+		// that the previous version left after the closing brace.
+		chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{},"finish_reason":%q}]}`, finishReasonForced)
+		fmt.Fprintf(w, "data: %s\n\n", chunk)
 		// Flush the termination chunks immediately.
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -277,7 +285,6 @@ func (p *Proxy) emitLoopTermination(w http.ResponseWriter, r *http.Request,
 	} else {
 		// 6.2: Assemble non-streaming JSON shape.
 		resp := buildNonStreamingResponse(r, accumulated.String(), finishReasonForced)
-		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, resp)
 	}
 }
