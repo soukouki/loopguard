@@ -188,6 +188,9 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
    - `usage`、`timings`、`finish_reason`をリクエスト単位で保持する。上流はこれらを最終チャンクに
      しか載せないため、非ストリーミングクライアント向けの組み立てでこれらを拾わないと、実際に
      トークンを消費したリクエストが0として記録される。
+   - `id`、`created`、`model`を最初のチャンクから、`reasoning_content`をチャンクごとに蓄積して
+     保持する。ループ検知のウィンドウは4章の通りデルタテキストだけを使い、`reasoning_content`は
+     本文とは別に扱う。
    - `detectLoop`を呼ぶ。
    - `clientWantsStream == true`の場合: 受信したチャンクを**即座に(`http.Flusher.Flush()`)**クライアントへ中継する。
    - `clientWantsStream == false`の場合: クライアントへは何も送らず、内部で蓄積するだけ。
@@ -198,7 +201,9 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
    (`data: [DONE]`の中継、または非ストリーム時は蓄積結果から完全なレスポンスJSONを
    組み立てる)を行う。組み立てたJSONには、ストリームから保持した`usage`と`timings`を、
    上流が実際に報告した場合だけ添える。報告しなかった場合に0やnullを書くと、呼び出し元が
-   それを実測値として読む。
+   それを実測値として読む。`id`、`created`、`model`、`reasoning_content`も同じ扱いで、上流が
+   報告した場合だけ添える。`id`だけは上流が報告しなかった場合に`chatcmocore-123`を placeholder
+   として残す。
 
 エンドポイント別のデルタ位置・終端条件のマッピング(実装時に実際のllama-serverバージョンの
 レスポンスで最終確認すること):

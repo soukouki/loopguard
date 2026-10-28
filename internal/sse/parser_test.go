@@ -124,3 +124,36 @@ func TestParseChunk_InvalidJSON(t *testing.T) {
 		t.Fatal("expected an error for a non-JSON payload")
 	}
 }
+
+func TestParseChunk_IdentityFields(t *testing.T) {
+	data := `{"id":"chatcmpl-abc","created":1700000000,"model":"gemma-4-e2b","choices":[{"index":0,"delta":{"content":"hi"}}]}`
+	c, err := ParseChunk(data)
+	if err != nil {
+		t.Fatalf("ParseChunk: %v", err)
+	}
+	if c.ID != "chatcmpl-abc" {
+		t.Errorf("id = %q, want chatcmpl-abc", c.ID)
+	}
+	if c.Created.String() != "1700000000" {
+		t.Errorf("created = %q, want 1700000000", c.Created.String())
+	}
+	if c.Model != "gemma-4-e2b" {
+		t.Errorf("model = %q, want gemma-4-e2b", c.Model)
+	}
+}
+
+func TestParseChunk_ReasoningContent(t *testing.T) {
+	// Reasoning is kept separate from the delta text so that the loop window
+	// still holds only the delta text of specification §4.1.
+	data := `{"choices":[{"index":0,"delta":{"content":"answer","reasoning_content":"thinking"}}]}`
+	c, err := ParseChunk(data)
+	if err != nil {
+		t.Fatalf("ParseChunk: %v", err)
+	}
+	if c.Delta != "answer" {
+		t.Errorf("delta = %q, want answer", c.Delta)
+	}
+	if c.ReasoningContent != "thinking" {
+		t.Errorf("reasoning_content = %q, want thinking", c.ReasoningContent)
+	}
+}

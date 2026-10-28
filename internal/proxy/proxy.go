@@ -43,15 +43,28 @@ const (
 // a non-streaming client loses them when the stream is reassembled without
 // carrying them (specification §5.5, §6.2).
 type streamMeta struct {
+	id           string
+	created      json.Number
+	model        string
 	usage        json.RawMessage
 	timings      json.RawMessage
 	finishReason string
+	reasoning    strings.Builder
 }
 
 // observe merges the fields reported by one chunk into the accumulated state.
 // It keeps the last non-empty value, so a chunk that reports nothing does not
 // clear what an earlier chunk reported.
 func (m *streamMeta) observe(c sse.Chunk) {
+	if m.id == "" {
+		m.id = c.ID
+	}
+	if m.created == "" {
+		m.created = c.Created
+	}
+	if m.model == "" {
+		m.model = c.Model
+	}
 	if len(c.Usage) > 0 {
 		m.usage = c.Usage
 	}
@@ -60,6 +73,9 @@ func (m *streamMeta) observe(c sse.Chunk) {
 	}
 	if c.FinishReason != "" {
 		m.finishReason = c.FinishReason
+	}
+	if c.ReasoningContent != "" {
+		m.reasoning.WriteString(c.ReasoningContent)
 	}
 }
 
@@ -82,9 +98,9 @@ type Proxy struct {
 	rp *httputil.ReverseProxy
 
 	// Loop-detection configuration.
-	minPeriod   int
-	maxPeriod   int
-	threshold   int // redundant repetitions bytes before cut-off
+	minPeriod int
+	maxPeriod int
+	threshold int // redundant repetitions bytes before cut-off
 }
 
 // New creates a Proxy that forwards to the child server at the given port.
@@ -281,7 +297,7 @@ func (p *Proxy) streamWithLoopDetection(
 		if detect.DetectLoop(window, p.minPeriod, p.maxPeriod, p.threshold) {
 			log.Println("loopguard: loop detected, terminating stream")
 			cancel() // 5.4: abort the upstream request.
-			p.emitLoopTermination(w, r, accumulatedText, clientWantsStream, meta)
+			p.emitLoopTermination(w, r, accumulatedText, clientWantsStream, &meta)
 			return
 		}
 
@@ -308,7 +324,7 @@ func (p *Proxy) streamWithLoopDetection(
 		}
 	} else {
 		// 5.5/6.2: Assemble a non-streaming JSON response from accumulated text.
-		assemble := buildNonStreamingResponse(r, accumulatedText.String(), meta.finishForAssembly(), meta)
+		assemble := buildNonStreamingResponse(r, accumulatedText.String(), meta.finishForAssembly(), &meta)
 		fmt.Fprint(w, assemble)
 	}
 }
@@ -316,7 +332,7 @@ func (p *Proxy) streamWithLoopDetection(
 // emitLoopTermination sends the spec §6 response to the client given the
 // text accumulated so far.
 func (p *Proxy) emitLoopTermination(w http.ResponseWriter, r *http.Request,
-	accumulated strings.Builder, clientWants bool, meta streamMeta) {
+	accumulated strings.Builder, clientWants bool, meta *streamMeta) {
 	if clientWants {
 		// 6.2: Send final chunk with finish_reason: "length", then [DONE].
 		// The chunk is emitted as a JSON document without the trailing comma
@@ -405,20 +421,32 @@ func rewriteBodyForChild(r *http.Request) ([]byte, bool, error) {
 // buildNonStreamingResponse assembles a complete JSON response for a
 // non-streaming client, using the text accumulated from the SSE stream and the
 // usage, timings and finish_reason reported by it.
-func buildNonStreamingResponse(r *http.Request, text string, finishReason string, meta streamMeta) string {
+func buildNonStreamingResponse(r *http.Request, text string, finishReason string, meta *streamMeta) string {
 	// Escape text as a JSON string.
 	escaped := jsonStringEscape(text)
+
+	// The identity fields are written only when the stream reported them, so a
+	// reassembled response carries the upstream's id, created and model instead
+	// of a placeholder that tells the client nothing about the request.
+	head := `"id":` + jsonStringEscape(orDefault(meta.id, placeholderID))
+	if meta.created != "" {
+		head += ",\"created\":" + meta.created.String()
+	}
+	if meta.model != "" {
+		head += ",\"model\":" + jsonStringEscape(meta.model)
+	}
+
 	var body string
 	switch r.URL.Path {
 	case "/completion", "/infill":
 		body = fmt.Sprintf(`{"choices":[{"text":%s}],"stop":%q`, escaped, finishReason)
 	case "/v1/completions":
-		body = fmt.Sprintf(`{"id":"chatcmocore-123","object":"text_completion","choices":[{"text":%s,"index":0,"finish_reason":%q}]`, escaped, finishReason)
+		body = fmt.Sprintf(`{%s,"object":"text_completion","choices":[{"text":%s,"index":0,"finish_reason":%q}]`, head, escaped, finishReason)
 	case "/v1/chat/completions":
-		body = fmt.Sprintf(`{"id":"chatcmocore-123","object":"chat.completion","choices":[{"index":0,"finish_reason":%q,"message":{"role":"assistant","content":%s}}]`, finishReason, escaped)
+		body = fmt.Sprintf(`{%s,"object":"chat.completion","choices":[{"index":0,"finish_reason":%q,"message":%s}]`, head, finishReason, messagePart(meta, escaped))
 	default:
 		// Fallback: return a generic shape.
-		body = fmt.Sprintf(`{"choices":[{"finish_reason":%q,"text":%s}]}`, finishReason, escaped)
+		body = fmt.Sprintf(`{%s,"choices":[{"finish_reason":%q,"text":%s}]}`, head, finishReason, escaped)
 	}
 
 	// usage and timings are appended only when the stream actually reported
@@ -431,6 +459,28 @@ func buildNonStreamingResponse(r *http.Request, text string, finishReason string
 		body += ",\"timings\":" + string(meta.timings)
 	}
 	return body + "}"
+}
+
+// placeholderID is the id written when the stream never reported one.
+const placeholderID = "chatcmocore-123"
+
+// messagePart builds the message object of a chat completion response. The
+// reasoning text is included only when the stream carried it, since a
+// non-streaming client would otherwise lose it entirely.
+func messagePart(meta *streamMeta, escapedContent string) string {
+	if meta.reasoning.Len() == 0 {
+		return `{"role":"assistant","content":` + escapedContent + "}"
+	}
+	return `{"role":"assistant","content":` + escapedContent +
+		",\"reasoning_content\":" + jsonStringEscape(meta.reasoning.String()) + "}"
+}
+
+// orDefault returns value when it is not empty, otherwise fallback.
+func orDefault(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
 
 // jsonStringEscape returns a JSON-encoded string literal for s (the value,

@@ -70,7 +70,7 @@ func TestIsGenerated_EndpointMatching(t *testing.T) {
 // non-streaming response shape for /v1/chat/completions (specification §6.2).
 func TestBuildNonStreamingResponse_ChatCompletions(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	resp := buildNonStreamingResponse(req, "hello world", "length", streamMeta{})
+	resp := buildNonStreamingResponse(req, "hello world", "length", &streamMeta{})
 	if !strings.Contains(resp, `"finish_reason":"length"`) {
 		t.Errorf("missing finish_reason: %s", resp)
 	}
@@ -82,7 +82,7 @@ func TestBuildNonStreamingResponse_ChatCompletions(t *testing.T) {
 // TestBuildNonStreamingResponse_Completion verifies the native /completion shape.
 func TestBuildNonStreamingResponse_Completion(t *testing.T) {
 	req := httptest.NewRequest("POST", "/completion", nil)
-	resp := buildNonStreamingResponse(req, "abc", "length", streamMeta{})
+	resp := buildNonStreamingResponse(req, "abc", "length", &streamMeta{})
 	if !strings.Contains(resp, `"text":"abc"`) {
 		t.Errorf("missing text: %s", resp)
 	}
@@ -99,7 +99,7 @@ func TestBuildNonStreamingResponse_CarriesUsageAndTimings(t *testing.T) {
 		timings:      json.RawMessage(`{"prompt_n":5,"predicted_n":12}`),
 		finishReason: "stop",
 	}
-	resp := buildNonStreamingResponse(req, "hello", "stop", meta)
+	resp := buildNonStreamingResponse(req, "hello", "stop", &meta)
 	if !strings.Contains(resp, `"usage":{"prompt_tokens":17`) {
 		t.Errorf("usage not carried: %s", resp)
 	}
@@ -119,9 +119,60 @@ func TestBuildNonStreamingResponse_CarriesUsageAndTimings(t *testing.T) {
 // would read that as a measurement of zero tokens.
 func TestBuildNonStreamingResponse_OmitsAbsentUsage(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	resp := buildNonStreamingResponse(req, "hello", "stop", streamMeta{})
+	resp := buildNonStreamingResponse(req, "hello", "stop", &streamMeta{})
 	if strings.Contains(resp, "usage") {
 		t.Errorf("usage should be absent when the stream reported none: %s", resp)
+	}
+}
+
+// TestBuildNonStreamingResponse_CarriesIdentityFields verifies that the id,
+// created and model reported by the stream survive reassembly, and that the
+// placeholder id is kept when the stream reported none.
+func TestBuildNonStreamingResponse_CarriesIdentityFields(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	meta := streamMeta{
+		id:      "chatcmpl-abc",
+		created: json.Number("1700000000"),
+		model:   "gemma-4-e2b",
+	}
+	resp := buildNonStreamingResponse(req, "hello", "stop", &meta)
+	if !strings.Contains(resp, `"id":"chatcmpl-abc"`) {
+		t.Errorf("id not carried: %s", resp)
+	}
+	if !strings.Contains(resp, `"created":1700000000`) {
+		t.Errorf("created not carried: %s", resp)
+	}
+	if !strings.Contains(resp, `"model":"gemma-4-e2b"`) {
+		t.Errorf("model not carried: %s", resp)
+	}
+
+	resp = buildNonStreamingResponse(req, "hello", "stop", &streamMeta{})
+	if !strings.Contains(resp, `"id":"chatcmocore-123"`) {
+		t.Errorf("placeholder id lost: %s", resp)
+	}
+	if strings.Contains(resp, "created") || strings.Contains(resp, "model") {
+		t.Errorf("fields the stream did not report should be absent: %s", resp)
+	}
+}
+
+// TestBuildNonStreamingResponse_CarriesReasoning verifies that reasoning text
+// accumulated from the stream is written to the message. Without it a
+// non-streaming client gets an empty message for a model that only produced
+// reasoning.
+func TestBuildNonStreamingResponse_CarriesReasoning(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	var meta streamMeta
+	meta.observe(sse.Chunk{ReasoningContent: "thinking"})
+	meta.observe(sse.Chunk{ReasoningContent: " harder"})
+	resp := buildNonStreamingResponse(req, "answer", "stop", &meta)
+	if !strings.Contains(resp, `"reasoning_content":"thinking harder"`) {
+		t.Errorf("reasoning not carried: %s", resp)
+	}
+
+	// A response with no reasoning must not gain an empty reasoning field.
+	resp = buildNonStreamingResponse(req, "answer", "stop", &streamMeta{})
+	if strings.Contains(resp, "reasoning_content") {
+		t.Errorf("empty reasoning field written: %s", resp)
 	}
 }
 
