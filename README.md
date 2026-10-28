@@ -1,5 +1,7 @@
 # loopguard
 
+[![test](https://github.com/soukouki/loopguard/actions/workflows/test.yml/badge.svg)](https://github.com/soukouki/loopguard/actions/workflows/test.yml)
+
 `loopguard` は、`llama-swap` と `llama-server` の間に配置する軽量なストリーミングプロキシであり、LLMの出力ループ（同じ文字列の繰り返し）を検知して、ストリームを早期に打ち切るためのツールです。
 
 ## 概要
