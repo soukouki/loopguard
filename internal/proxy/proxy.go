@@ -38,6 +38,42 @@ const (
 	windowBufSize = 1 << 15 // 32 KiB; ample headroom over the worst case.
 )
 
+// streamMeta is the per-request state accumulated while scanning the SSE
+// stream. Upstream servers report usage and timings only on the final chunk, so
+// a non-streaming client loses them when the stream is reassembled without
+// carrying them (specification §5.5, §6.2).
+type streamMeta struct {
+	usage        json.RawMessage
+	timings      json.RawMessage
+	finishReason string
+}
+
+// observe merges the fields reported by one chunk into the accumulated state.
+// It keeps the last non-empty value, so a chunk that reports nothing does not
+// clear what an earlier chunk reported.
+func (m *streamMeta) observe(c sse.Chunk) {
+	if len(c.Usage) > 0 {
+		m.usage = c.Usage
+	}
+	if len(c.Timings) > 0 {
+		m.timings = c.Timings
+	}
+	if c.FinishReason != "" {
+		m.finishReason = c.FinishReason
+	}
+}
+
+// finishForAssembly returns the finish_reason to write into a reassembled
+// response. Loop detection keeps the fixed value (specification §6); a stream
+// that ended normally reports the value the upstream actually sent, and falls
+// back to "stop" when the upstream reported none.
+func (m *streamMeta) finishForAssembly() string {
+	if m.finishReason != "" {
+		return m.finishReason
+	}
+	return "stop"
+}
+
 // Proxy is the central loopguard HTTP handler. It wraps both the pass-through
 // ReverseProxy and the interception logic for generation endpoints.
 type Proxy struct {
@@ -197,8 +233,11 @@ func (p *Proxy) streamWithLoopDetection(
 
 	// For non-streaming clients, we accumulate the full text and assemble a
 	// complete JSON response at the end. We track the "delta content" via
-	// the SSE data payloads (specification §5.196-203).
+	// the SSE data payloads (specification §5.196-203), and we also carry the
+	// usage, timings and finish_reason reported by the stream so the assembled
+	// response is not a shape-only stub (specification §5.5, §6.2).
 	var accumulatedText strings.Builder
+	var meta streamMeta
 
 	for {
 		line, err := br.ReadString('\n')
@@ -222,7 +261,13 @@ func (p *Proxy) streamWithLoopDetection(
 			break
 		}
 
-		delta := sse.ExtractDelta(data)
+		chunk, err := sse.ParseChunk(data)
+		if err != nil {
+			continue
+		}
+		meta.observe(chunk)
+
+		delta := chunk.Delta
 
 		// 4.2/3: Append raw delta text to the window and trim to W bytes.
 		window = append(window, []byte(delta)...)
@@ -236,7 +281,7 @@ func (p *Proxy) streamWithLoopDetection(
 		if detect.DetectLoop(window, p.minPeriod, p.maxPeriod, p.threshold) {
 			log.Println("loopguard: loop detected, terminating stream")
 			cancel() // 5.4: abort the upstream request.
-			p.emitLoopTermination(w, r, accumulatedText, clientWantsStream)
+			p.emitLoopTermination(w, r, accumulatedText, clientWantsStream, meta)
 			return
 		}
 
@@ -263,7 +308,7 @@ func (p *Proxy) streamWithLoopDetection(
 		}
 	} else {
 		// 5.5/6.2: Assemble a non-streaming JSON response from accumulated text.
-		assemble := buildNonStreamingResponse(r, accumulatedText.String(), finishReasonForced)
+		assemble := buildNonStreamingResponse(r, accumulatedText.String(), meta.finishForAssembly(), meta)
 		fmt.Fprint(w, assemble)
 	}
 }
@@ -271,7 +316,7 @@ func (p *Proxy) streamWithLoopDetection(
 // emitLoopTermination sends the spec §6 response to the client given the
 // text accumulated so far.
 func (p *Proxy) emitLoopTermination(w http.ResponseWriter, r *http.Request,
-	accumulated strings.Builder, clientWants bool) {
+	accumulated strings.Builder, clientWants bool, meta streamMeta) {
 	if clientWants {
 		// 6.2: Send final chunk with finish_reason: "length", then [DONE].
 		// The chunk is emitted as a JSON document without the trailing comma
@@ -284,7 +329,7 @@ func (p *Proxy) emitLoopTermination(w http.ResponseWriter, r *http.Request,
 		}
 	} else {
 		// 6.2: Assemble non-streaming JSON shape.
-		resp := buildNonStreamingResponse(r, accumulated.String(), finishReasonForced)
+		resp := buildNonStreamingResponse(r, accumulated.String(), finishReasonForced, meta)
 		fmt.Fprint(w, resp)
 	}
 }
@@ -358,23 +403,34 @@ func rewriteBodyForChild(r *http.Request) ([]byte, bool, error) {
 }
 
 // buildNonStreamingResponse assembles a complete JSON response for a
-// non-streaming client that was cut short by loop detection.
-func buildNonStreamingResponse(r *http.Request, text string, finishReason string) string {
+// non-streaming client, using the text accumulated from the SSE stream and the
+// usage, timings and finish_reason reported by it.
+func buildNonStreamingResponse(r *http.Request, text string, finishReason string, meta streamMeta) string {
 	// Escape text as a JSON string.
 	escaped := jsonStringEscape(text)
+	var body string
 	switch r.URL.Path {
 	case "/completion", "/infill":
-		return fmt.Sprintf(`{"choices":[{"text":%s}],"stop":"%s"}`, escaped, finishReason)
+		body = fmt.Sprintf(`{"choices":[{"text":%s}],"stop":%q`, escaped, finishReason)
 	case "/v1/completions":
-		return fmt.Sprintf(`{"id":"chatcmocore-123","object":"text_completion","choices":[{"text":%s,"index":0,"finish_reason":"%s"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
-			escaped, finishReason)
+		body = fmt.Sprintf(`{"id":"chatcmocore-123","object":"text_completion","choices":[{"text":%s,"index":0,"finish_reason":%q}]`, escaped, finishReason)
 	case "/v1/chat/completions":
-		return fmt.Sprintf(`{"id":"chatcmocore-123","object":"chat.completion","choices":[{"index":0,"finish_reason":"%s","message":{"role":"assistant","content":%s}}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
-			finishReason, escaped)
+		body = fmt.Sprintf(`{"id":"chatcmocore-123","object":"chat.completion","choices":[{"index":0,"finish_reason":%q,"message":{"role":"assistant","content":%s}}]`, finishReason, escaped)
 	default:
 		// Fallback: return a generic shape.
-		return fmt.Sprintf(`{"choices":[{"finish_reason":"%s","text":%s}]}`, finishReason, escaped)
+		body = fmt.Sprintf(`{"choices":[{"finish_reason":%q,"text":%s}]}`, finishReason, escaped)
 	}
+
+	// usage and timings are appended only when the stream actually reported
+	// them, so a stream that never reported them does not produce a null field
+	// that a client or llama-swap would read as a real measurement.
+	if len(meta.usage) > 0 {
+		body += ",\"usage\":" + string(meta.usage)
+	}
+	if len(meta.timings) > 0 {
+		body += ",\"timings\":" + string(meta.timings)
+	}
+	return body + "}"
 }
 
 // jsonStringEscape returns a JSON-encoded string literal for s (the value,
