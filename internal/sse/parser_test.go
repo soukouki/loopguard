@@ -1,6 +1,9 @@
 package sse
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseLine_DataPrefix(t *testing.T) {
 	ok, data := ParseLine("data: hello")
@@ -80,5 +83,44 @@ func TestExtractDelta_Escapes(t *testing.T) {
 func TestExtractDelta_NotJSON(t *testing.T) {
 	if got := ExtractDelta("not json"); got != "" {
 		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestParseChunk_UsageAndTimingsOnFinalChunk(t *testing.T) {
+	// Upstream servers report usage and timings only on the final chunk.
+	data := `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":5},"timings":{"prompt_n":17}}`
+	c, err := ParseChunk(data)
+	if err != nil {
+		t.Fatalf("ParseChunk: %v", err)
+	}
+	if c.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop", c.FinishReason)
+	}
+	if len(c.Usage) == 0 || !strings.Contains(string(c.Usage), `"prompt_tokens":17`) {
+		t.Errorf("usage = %q, want the raw usage object", c.Usage)
+	}
+	if len(c.Timings) == 0 || !strings.Contains(string(c.Timings), `"prompt_n":17`) {
+		t.Errorf("timings = %q, want the raw timings object", c.Timings)
+	}
+}
+
+func TestParseChunk_NativeCompletionStopTrue(t *testing.T) {
+	// Native /completion shape: delta at top level, terminal condition is stop true.
+	data := `{"content":"done","stop":true,"timings":{"predicted_n":4}}`
+	c, err := ParseChunk(data)
+	if err != nil {
+		t.Fatalf("ParseChunk: %v", err)
+	}
+	if c.Delta != "done" {
+		t.Errorf("delta = %q, want done", c.Delta)
+	}
+	if c.FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want stop", c.FinishReason)
+	}
+}
+
+func TestParseChunk_InvalidJSON(t *testing.T) {
+	if _, err := ParseChunk("not json"); err == nil {
+		t.Fatal("expected an error for a non-JSON payload")
 	}
 }

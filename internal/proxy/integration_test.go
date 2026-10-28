@@ -262,3 +262,91 @@ func TestLoopTerminationChunkIsJSON(t *testing.T) {
 		t.Errorf("finish_reason = %v, want length", choices[0].(map[string]any)["finish_reason"])
 	}
 }
+
+// TestNonStreamingE2E_CarriesUsage verifies that a non-streaming client gets the
+// usage and timings the upstream reported on its final chunk, together with the
+// finish_reason the upstream reported (specification §5.5, §6.2).
+//
+// The first chunk is the role-only chunk that /v1/chat/completions sends, where
+// delta.content is null, so this test also pins that field names do not leak
+// into the assembled text.
+func TestNonStreamingE2E_CarriesUsage(t *testing.T) {
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flush", http.StatusInternalServerError)
+			return
+		}
+		flusher.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null}}],\"created\":1700000000,\"id\":\"chatcmpl-1\"}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":5,\"total_tokens\":22},\"timings\":{\"prompt_n\":17,\"predicted_n\":5}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer childServer.Close()
+
+	port := parsePort(childServer.URL)
+	p := New(port, 1, 4000, 250)
+
+	// stream omitted, so the client is non-streaming.
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[]}`)))
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	result := rr.Body.String()
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("assembled response is not valid JSON: %v (%s)", err, result)
+	}
+	usage, ok := parsed["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage missing from assembled response: %s", result)
+	}
+	if usage["prompt_tokens"] != float64(17) || usage["completion_tokens"] != float64(5) {
+		t.Errorf("usage = %v, want prompt 17 and completion 5", usage)
+	}
+	timings, ok := parsed["timings"].(map[string]any)
+	if !ok {
+		t.Fatalf("timings missing from assembled response: %s", result)
+	}
+	if timings["prompt_n"] != float64(17) {
+		t.Errorf("timings = %v, want prompt_n 17", timings)
+	}
+	choices, ok := parsed["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("choices missing from assembled response: %s", result)
+	}
+	choice := choices[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Errorf("finish_reason = %v, want the value the upstream reported", choice["finish_reason"])
+	}
+	msg, ok := choice["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("message missing from assembled response: %s", result)
+	}
+	if msg["content"] != "hello" {
+		t.Errorf("content = %q, want %q (field names must not leak into the text)", msg["content"], "hello")
+	}
+}
+
+// TestNonStreamingE2E_LoopCutStillReportsLength verifies that loop detection
+// keeps the fixed finish_reason (specification §6) even though a normal
+// completion now reports the upstream's own value.
+func TestNonStreamingE2E_LoopCutStillReportsLength(t *testing.T) {
+	pattern := generateCounterPattern(160)
+	childPort, childServer := startMockSSE(t, pattern, 4)
+	defer childServer.Close()
+
+	p := New(childPort, 1, 4000, 250)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[]}`)))
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	result := rr.Body.String()
+	if !strings.Contains(result, `"finish_reason":"length"`) {
+		t.Errorf("loop cut should report finish_reason:length, got: %s", result)
+	}
+}

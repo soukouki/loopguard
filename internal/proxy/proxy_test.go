@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sou7/loopguard/internal/sse"
 )
 
 // TestRewriteBodyForChild_ForcesStream verifies that rewriteBodyForChild
@@ -67,7 +70,7 @@ func TestIsGenerated_EndpointMatching(t *testing.T) {
 // non-streaming response shape for /v1/chat/completions (specification §6.2).
 func TestBuildNonStreamingResponse_ChatCompletions(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	resp := buildNonStreamingResponse(req, "hello world", "length")
+	resp := buildNonStreamingResponse(req, "hello world", "length", streamMeta{})
 	if !strings.Contains(resp, `"finish_reason":"length"`) {
 		t.Errorf("missing finish_reason: %s", resp)
 	}
@@ -79,8 +82,68 @@ func TestBuildNonStreamingResponse_ChatCompletions(t *testing.T) {
 // TestBuildNonStreamingResponse_Completion verifies the native /completion shape.
 func TestBuildNonStreamingResponse_Completion(t *testing.T) {
 	req := httptest.NewRequest("POST", "/completion", nil)
-	resp := buildNonStreamingResponse(req, "abc", "length")
+	resp := buildNonStreamingResponse(req, "abc", "length", streamMeta{})
 	if !strings.Contains(resp, `"text":"abc"`) {
 		t.Errorf("missing text: %s", resp)
+	}
+}
+
+// TestBuildNonStreamingResponse_CarriesUsageAndTimings verifies that the usage
+// and timings reported by the stream survive reassembly. Without them a
+// non-streaming client, and llama-swap's activity log, record zeros for a
+// request that really consumed tokens.
+func TestBuildNonStreamingResponse_CarriesUsageAndTimings(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	meta := streamMeta{
+		usage:        json.RawMessage(`{"prompt_tokens":17,"completion_tokens":12,"total_tokens":29}`),
+		timings:      json.RawMessage(`{"prompt_n":5,"predicted_n":12}`),
+		finishReason: "stop",
+	}
+	resp := buildNonStreamingResponse(req, "hello", "stop", meta)
+	if !strings.Contains(resp, `"usage":{"prompt_tokens":17`) {
+		t.Errorf("usage not carried: %s", resp)
+	}
+	if !strings.Contains(resp, `"timings":{"prompt_n":5`) {
+		t.Errorf("timings not carried: %s", resp)
+	}
+	if !strings.Contains(resp, `"finish_reason":"stop"`) {
+		t.Errorf("finish_reason should be the value the stream reported: %s", resp)
+	}
+	if !json.Valid([]byte(resp)) {
+		t.Errorf("assembled response is not valid JSON: %s", resp)
+	}
+}
+
+// TestBuildNonStreamingResponse_OmitsAbsentUsage verifies that a stream which
+// reported no usage does not produce a null or zero usage field, since a client
+// would read that as a measurement of zero tokens.
+func TestBuildNonStreamingResponse_OmitsAbsentUsage(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	resp := buildNonStreamingResponse(req, "hello", "stop", streamMeta{})
+	if strings.Contains(resp, "usage") {
+		t.Errorf("usage should be absent when the stream reported none: %s", resp)
+	}
+}
+
+// TestStreamMeta_FinishForAssembly verifies the finish_reason used for a
+// reassembled response: the value the stream reported when there was one,
+// otherwise "stop".
+func TestStreamMeta_FinishForAssembly(t *testing.T) {
+	if got := (&streamMeta{finishReason: "stop"}).finishForAssembly(); got != "stop" {
+		t.Errorf("got %q, want stop", got)
+	}
+	if got := (&streamMeta{}).finishForAssembly(); got != "stop" {
+		t.Errorf("got %q, want stop", got)
+	}
+}
+
+// TestStreamMeta_ObservKeepsLastValue verifies that a chunk reporting no usage
+// does not clear usage observed on an earlier chunk.
+func TestStreamMeta_ObservKeepsLastValue(t *testing.T) {
+	var meta streamMeta
+	meta.observe(sse.Chunk{Usage: json.RawMessage(`{"prompt_tokens":10}`)})
+	meta.observe(sse.Chunk{Delta: "x"})
+	if len(meta.usage) == 0 {
+		t.Fatal("usage was cleared by a chunk that reported none")
 	}
 }
