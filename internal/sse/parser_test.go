@@ -41,10 +41,29 @@ func TestExtractDelta_TextCompletions(t *testing.T) {
 	}
 }
 
+func TestExtractDelta_NativeCompletionTopLevel(t *testing.T) {
+	// Native /completion shape carries the delta at top level.
+	data := `{"content":"done","stop":true}`
+	if got := ExtractDelta(data); got != "done" {
+		t.Errorf("got %q, want %q", got, "done")
+	}
+}
+
 func TestExtractDelta_FinishReasonOnly(t *testing.T) {
 	// A chunk that only has finish_reason (no content): should return ""
 	// so window is not polluted and no false loop is triggered.
 	data := `{"choices":[{"finish_reason":"stop"}]}`
+	if got := ExtractDelta(data); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestExtractDelta_NullContent(t *testing.T) {
+	// The role-only first chunk of /v1/chat/completions has delta.content null.
+	// A substring parser reads the next quoted token after "content":, which is
+	// a field name, so the window and the assembled text got polluted with the
+	// word "created".
+	data := `{"choices":[{"index":0,"delta":{"role":"assistant","content":null}}],"created":1700000000,"id":"chatcmpl-1"}`
 	if got := ExtractDelta(data); got != "" {
 		t.Errorf("got %q, want empty", got)
 	}
