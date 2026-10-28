@@ -51,15 +51,15 @@ func isWhitespaceOnly(b []byte) bool {
 //   - minPeriod, maxPeriod: accepted period length bounds (in bytes).
 //   - thresholdBytes: redundant bytes of repetition required before a loop is
 //     considered established. A loop is detected when:
-//       period * (repeats - 1) > thresholdBytes
+//     period * (repeats - 1) > thresholdBytes
 //
 // Algorithm:
-//   1. Compute the prefix function of the window.
-//   2. Derive the minimal period: period = n - pi[n-1].
-//   3. Validate the period is within bounds.
-//   4. Compute repeats = n / period.
-//   5. Check redundant volume: period * (repeats - 1) > thresholdBytes.
-//   6. Reject whitespace-only periods.
+//  1. Compute the prefix function of the window.
+//  2. Derive the minimal period: period = n - pi[n-1].
+//  3. Validate the period is within bounds.
+//  4. Compute repeats = n / period.
+//  5. Check redundant volume: period * (repeats - 1) > thresholdBytes.
+//  6. Reject whitespace-only periods.
 //
 // If the window is too short for any valid period, returns false.
 func DetectLoop(window []byte, minPeriod, maxPeriod, thresholdBytes int) bool {
