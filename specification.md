@@ -170,8 +170,10 @@ func detectLoop(window []byte, minPeriod, maxPeriod, thresholdBytes int) bool {
 
 **設計の核心(重要なので明記): クライアントが`stream: true`を指定したかどうかに
 関わらず、loopguard から llama-server へのリクエストは常に`stream: true`を強制する。**
-SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control: no-cache`を設定し、
-中継HTTPレイヤーのバッファリングを防ぐ。**
+ストリーミングクライアントへのレスポンスのヘッダーには`X-Accel-Buffering: no`と
+`Cache-Control: no-cache`を設定し、中継HTTPレイヤーのバッファリングを防ぐ。
+非ストリーミングクライアントへのレスポンスの`Content-Type`は`application/json`とする。
+(6章参照)**
 
 理由: 非ストリーミングのレスポンスはllama-server内部で生成完了まで確定しないため、外部から
 早期打ち切りを判定する材料(部分テキスト)が得られない。常に内部だけSSEにすることで、
@@ -188,6 +190,9 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
    - `usage`、`timings`、`finish_reason`をリクエスト単位で保持する。上流はこれらを最終チャンクに
      しか載せないため、非ストリーミングクライアント向けの組み立てでこれらを拾わないと、実際に
      トークンを消費したリクエストが0として記録される。
+   - `id`、`created`、`model`を最初のチャンクから、`reasoning_content`をチャンクごとに蓄積して
+     保持する。ループ検知のウィンドウは4章の通りデルタテキストだけを使い、`reasoning_content`は
+     本文とは別に扱う。
    - `detectLoop`を呼ぶ。
    - `clientWantsStream == true`の場合: 受信したチャンクを**即座に(`http.Flusher.Flush()`)**クライアントへ中継する。
    - `clientWantsStream == false`の場合: クライアントへは何も送らず、内部で蓄積するだけ。
@@ -198,7 +203,9 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
    (`data: [DONE]`の中継、または非ストリーム時は蓄積結果から完全なレスポンスJSONを
    組み立てる)を行う。組み立てたJSONには、ストリームから保持した`usage`と`timings`を、
    上流が実際に報告した場合だけ添える。報告しなかった場合に0やnullを書くと、呼び出し元が
-   それを実測値として読む。
+   それを実測値として読む。`id`、`created`、`model`、`reasoning_content`も同じ扱いで、上流が
+   報告した場合だけ添える。`id`だけは上流が報告しなかった場合に`chatcmocore-123`を placeholder
+   として残す。
 
 エンドポイント別のデルタ位置・終端条件のマッピング(実装時に実際のllama-serverバージョンの
 レスポンスで最終確認すること):
@@ -235,7 +242,8 @@ SSEレスポンスのヘッダーには`X-Accel-Buffering: no`と`Cache-Control:
   チャンクを送らないので、通常は`usage`は取得できない。
 
 打ち切りだったかどうかを機械的に判別したいクライアント向けの追加フィールドは今回のv1では
-実装しない(finish_reason: "length"のみで十分。必要になれば後で足す)。
+実装しない。正常終了では上流が報告したfinish_reasonを使い、打ち切りでのみ`"length"`を返すことで
+区別できるようにした。
 
 ---
 

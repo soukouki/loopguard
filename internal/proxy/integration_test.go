@@ -350,3 +350,55 @@ func TestNonStreamingE2E_LoopCutStillReportsLength(t *testing.T) {
 		t.Errorf("loop cut should report finish_reason:length, got: %s", result)
 	}
 }
+
+// TestNonStreamingE2E_CarriesIdentityAndReasoning verifies that a non-streaming
+// client gets the id, created, model and reasoning text reported by the stream.
+func TestNonStreamingE2E_CarriesIdentityAndReasoning(t *testing.T) {
+	childServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flush", http.StatusInternalServerError)
+			return
+		}
+		flusher.Flush()
+		fmt.Fprint(w, "data: {\"id\":\"chatcmpl-abc\",\"created\":1700000000,\"model\":\"gemma-4-e2b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":5}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer childServer.Close()
+
+	port := parsePort(childServer.URL)
+	p := New(port, 1, 4000, 250)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"test","messages":[]}`)))
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rr.Body.String()), &parsed); err != nil {
+		t.Fatalf("assembled response is not valid JSON: %v (%s)", err, rr.Body.String())
+	}
+	if parsed["id"] != "chatcmpl-abc" {
+		t.Errorf("id = %v, want chatcmpl-abc", parsed["id"])
+	}
+	if parsed["created"] != float64(1700000000) {
+		t.Errorf("created = %v, want 1700000000", parsed["created"])
+	}
+	if parsed["model"] != "gemma-4-e2b" {
+		t.Errorf("model = %v, want gemma-4-e2b", parsed["model"])
+	}
+	choice := parsed["choices"].([]any)[0].(map[string]any)
+	msg, ok := choice["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("message missing from assembled response: %s", rr.Body.String())
+	}
+	if msg["content"] != "answer" {
+		t.Errorf("content = %v, want answer", msg["content"])
+	}
+	if msg["reasoning_content"] != "thinking" {
+		t.Errorf("reasoning_content = %v, want thinking", msg["reasoning_content"])
+	}
+}

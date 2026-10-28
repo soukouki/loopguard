@@ -39,10 +39,22 @@ type Chunk struct {
 	// chunk carries no delta, for example a finish_reason-only chunk.
 	Delta string
 
+	// ReasoningContent is the reasoning text carried by the delta of
+	// /v1/chat/completions. It is kept separate from Delta so that the loop
+	// window keeps holding the delta text of specification §4.1.
+	ReasoningContent string
+
 	// FinishReason is the finish_reason reported by the chunk, or "" when it
 	// is absent or null. For the native shapes, a chunk with "stop": true is
 	// reported as "stop".
 	FinishReason string
+
+	// ID, Created and Model are the identity fields reported by the chunk.
+	// Upstream servers report them on every chunk, so the first chunk seen is
+	// enough.
+	ID      string
+	Created json.Number
+	Model   string
 
 	// Usage and Timings are the raw JSON objects reported by the chunk, or
 	// nil when the chunk does not carry them. Upstream servers put them on
@@ -55,10 +67,14 @@ type Chunk struct {
 // specification §5 mapping table. Fields from shapes that do not apply stay
 // zero.
 type chunkShape struct {
+	ID      string      `json:"id"`
+	Created json.Number `json:"created"`
+	Model   string      `json:"model"`
 	Choices []struct {
 		Text  string `json:"text"`
 		Delta struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -85,13 +101,20 @@ func ParseChunk(data string) (Chunk, error) {
 		return Chunk{}, err
 	}
 
-	c := Chunk{Usage: shape.Usage, Timings: shape.Timings}
+	c := Chunk{
+		ID:      shape.ID,
+		Created: shape.Created,
+		Model:   shape.Model,
+		Usage:   shape.Usage,
+		Timings: shape.Timings,
+	}
 
 	if len(shape.Choices) > 0 {
 		choice := shape.Choices[0]
 		// /v1/chat/completions puts the delta under choices[0].delta, while
 		// /v1/completions puts it at choices[0].text.
 		c.Delta = choice.Delta.Content
+		c.ReasoningContent = choice.Delta.ReasoningContent
 		if c.Delta == "" {
 			c.Delta = choice.Text
 		}
